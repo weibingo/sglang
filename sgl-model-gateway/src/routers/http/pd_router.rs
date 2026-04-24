@@ -52,6 +52,7 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub dp_aware: bool,
 }
 
 #[derive(Clone)]
@@ -165,6 +166,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            dp_aware: ctx.router_config.dp_aware,
         })
     }
 
@@ -272,6 +274,16 @@ impl PDRouter {
             );
         }
         Ok(original)
+    }
+
+    fn inject_dp_rank(&self, json_request: &mut Value, worker: &dyn Worker) {
+        if self.dp_aware {
+            if let Some(dp_rank) = worker.dp_rank() {
+                if let Some(obj) = json_request.as_object_mut() {
+                    obj.insert("data_parallel_rank".to_string(), Value.from(dp_rank));
+                }
+            }
+        }
     }
 
     async fn execute_dual_dispatch<T: Serialize + Clone>(
@@ -550,12 +562,15 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // TODO prefill inject data-rank, then decode has radix cache, also inject
+        let mut prefill_json_request = serde_json.to_value(json_request)?;
+        self.inject_dp_rank($mut prefill_json_request, prefill.as_ref())
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
             prefill.url(),
             context.route,
-            &json_request,
+            &prefill_json_request,
             headers,
             false,
         );
