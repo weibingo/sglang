@@ -215,11 +215,13 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const DP_RANK_KEY: &'static str = "data_parallel_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
+        dp_aware: bool,
     ) -> Result<Value, String> {
         let obj = original
             .as_object_mut()
@@ -273,16 +275,33 @@ impl PDRouter {
                 Value::from(super::pd_types::generate_room_id()),
             );
         }
+        if dp_aware {
+            let (real_url, dp_rank) = match Self::extract_dp_rank(prefill_worker.url()) {
+                Ok(url, rank) => (url, rank),
+                Err(_) => (prefill_worker.url(), 0),
+            };
+            obj.insert(
+                Self::DP_RANK_KEY.to_string(),
+                Value::from(dp_rank),
+            );
+        }
         Ok(original)
     }
 
-    fn inject_dp_rank(&self, json_request: &mut Value, worker: &dyn Worker) {
-        if self.dp_aware {
-            if let Some(dp_rank) = worker.dp_rank() {
-                if let Some(obj) = json_request.as_object_mut() {
-                    obj.insert("data_parallel_rank".to_string(), Value.from(dp_rank));
-                }
-            }
+    // TODO (rui): Better accommodate to the Worker abstraction
+    fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
+        let parts: Vec<&str> = worker_url.split('@').collect();
+        if parts.len() != 2 {
+            return Err(format!("invalid worker_url format: {}", worker_url));
+        }
+
+        // Parse the second part (dp_rank) into an integer
+        match parts[1].parse::<usize>() {
+            Ok(dp_rank) => Ok((parts[0], dp_rank)),
+            Err(_) => Err(format!(
+                "failed to parse dp_rank from worker_url: {}",
+                worker_url
+            )),
         }
     }
 
@@ -348,6 +367,7 @@ impl PDRouter {
                             json_request,
                             prefill.as_ref(),
                             context.batch_size,
+                            self.dp_aware,
                         ) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
@@ -562,21 +582,26 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        // TODO prefill inject data-rank, then decode has radix cache, also inject
-        let mut prefill_json_request = serde_json.to_value(json_request)?;
-        self.inject_dp_rank($mut prefill_json_request, prefill.as_ref())
+        let prefill_url = match Self::extract_dp_rank(prefill.url()) {
+            Ok((url, _)) => url,
+            Err(_) => prefill.url()
+        };
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
-            prefill.url(),
+            prefill_url,
             context.route,
-            &prefill_json_request,
+            &json_request,
             headers,
             false,
         );
+        let decode_url = match Self::extract_dp_rank(decode.url()) {
+            Ok((url, _)) => url,
+            Err(_) => decode.url()
+        };
         let decode_request = self.build_post_with_headers(
             &self.client,
-            decode.url(),
+            decode_url,
             context.route,
             &json_request,
             headers,
@@ -1442,6 +1467,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            dp_aware: false,
         }
     }
 
