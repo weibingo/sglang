@@ -215,7 +215,8 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
-    const DP_RANK_KEY: &'static str = "data_parallel_rank";
+    const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
+    const ROUTED_DP_RANK_KEY: &'static str = "routed_dp_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -277,11 +278,29 @@ impl PDRouter {
         }
         if dp_aware {
             let (real_url, dp_rank) = match Self::extract_dp_rank(prefill_worker.url()) {
-                Ok(url, rank) => (url, rank),
+                Ok((url, rank)) => (url, rank),
                 Err(_) => (prefill_worker.url(), 0),
             };
             obj.insert(
-                Self::DP_RANK_KEY.to_string(),
+                Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
+                Value::from(dp_rank),
+            );
+        }
+        Ok(original)
+    }
+
+    fn inject_dp_rank_into_value(
+        mut original: Value,
+        dp_rank: usize,
+        dp_aware: bool,
+    ) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        if dp_aware {
+            obj.insert(
+                Self::ROUTED_DP_RANK_KEY.to_string(),
                 Value::from(dp_rank),
             );
         }
@@ -582,28 +601,48 @@ impl PDRouter {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let prefill_url = match Self::extract_dp_rank(prefill.url()) {
-            Ok((url, _)) => url,
-            Err(_) => prefill.url()
+        let (prefill_url, prefill_rank) = match Self::extract_dp_rank(prefill.url()) {
+            Ok((url, rank)) => (url, rank),
+            Err(_) => (prefill.url(), 0),
         };
+        let mut prefill_json_request = json_request.clone();
+        prefill_json_request = match Self::inject_dp_rank_into_value(
+            prefill_json_request,
+            prefill_rank,
+            self.dp_aware,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
             prefill_url,
             context.route,
-            &json_request,
+            &prefill_json_request,
             headers,
             false,
         );
-        let decode_url = match Self::extract_dp_rank(decode.url()) {
-            Ok((url, _)) => url,
-            Err(_) => decode.url()
+
+        let (decode_url, decode_rank) = match Self::extract_dp_rank(decode.url()) {
+            Ok((url, rank)) => (url, rank),
+            Err(_) => (decode.url(), 0),
+        };
+        let mut decode_json_request = json_request.clone();
+        decode_json_request = match Self::inject_dp_rank_into_value(
+            decode_json_request,
+            decode_rank,
+            self.dp_aware,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
         };
         let decode_request = self.build_post_with_headers(
             &self.client,
             decode_url,
             context.route,
-            &json_request,
+            &decode_json_request,
             headers,
             false,
         );
